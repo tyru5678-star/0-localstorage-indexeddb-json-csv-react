@@ -519,6 +519,7 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, optio
   const deadline = Date.now() + 20000;
   let searched = 0;
   const maxSearch = 1500000;
+  let bestPartial = [];
   const orderedTasks = [...tasks].sort((a, b) =>
     a.candidates.length - b.candidates.length ||
     Number(b.item.continuous) - Number(a.item.continuous)
@@ -527,6 +528,9 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, optio
   const walk = (taskIndex) => {
     if (Date.now() > deadline || searched >= maxSearch) return false;
     if (taskIndex === orderedTasks.length) return true;
+    if (state.placements.length > bestPartial.length) {
+      bestPartial = [...state.placements];
+    }
 
     searched += 1;
     if (searched % 5000 === 0) {
@@ -556,7 +560,32 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, optio
     return false;
   };
 
-  return walk(0) ? [...state.placements] : null;
+  if (walk(0)) return [...state.placements];
+
+  const greedyPartial = constructGreedyBestEffortPlacement({
+    tasks: orderedTasks,
+    settings,
+    options,
+  });
+
+  return greedyPartial.length > bestPartial.length ? greedyPartial : bestPartial;
+}
+
+function constructGreedyBestEffortPlacement({ tasks, settings, options = {} }) {
+  const state = createPlacementState();
+
+  tasks.forEach((task) => {
+    const candidate = task.candidates
+      .filter((option) => canUseHardCandidate(option, state))
+      .sort((a, b) =>
+        scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries) -
+        scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries)
+      )[0];
+
+    if (candidate) applyPlacementToState(state, candidate);
+  });
+
+  return state.placements;
 }
 
 function remainingHardTasksStillFeasible(tasks, startIndex, state) {
@@ -1024,7 +1053,11 @@ function scoreWholeSchedule(state, settings, dayCapacity, options = {}) {
       ),
     0
   );
-  return placementScore + scoreDayBalance(state.classDayCounts, settings, dayCapacity, state.classEntries, options);
+  return (
+    placementScore +
+    scoreDayBalance(state.classDayCounts, settings, dayCapacity, state.classEntries, options) +
+    scoreFirstPeriodBalance(state.classEntries)
+  );
 }
 
 function scoreDayBalance(classDayCounts, settings, dayCapacity, classEntries = {}, options = {}) {
@@ -1081,6 +1114,20 @@ function scoreAdjacencyPreference(classSchedule, counts, options = {}) {
   }, 0);
 }
 
+function scoreFirstPeriodBalance(classEntries = {}) {
+  const counts = Object.values(classEntries).map((classSchedule) =>
+    Object.keys(classSchedule).filter((slotKey) => slotKey.endsWith('-1')).length
+  );
+  if (counts.length === 0) return 0;
+
+  const average = counts.reduce((sum, count) => sum + count, 0) / counts.length;
+  const spreadScore = counts.reduce((sum, count) => sum + (count - average) ** 2 * 26000, 0);
+  const maxCount = Math.max(...counts);
+  const minCount = Math.min(...counts);
+
+  return spreadScore + Math.max(0, maxCount - minCount - 1) ** 2 * 90000;
+}
+
 function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
   const continuousItemIds = [...new Set(
     tasks
@@ -1095,7 +1142,9 @@ function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, sett
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
+    const currentScore =
+      scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options) +
+      scoreFirstPeriodBalance(currentState.classEntries);
     let bestSwap = null;
 
     for (const itemId of continuousItemIds) {
@@ -1120,7 +1169,9 @@ function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, sett
           if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
           const candidateState = buildStateFromPlacements(candidatePlacements);
-          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
+          const candidateScore =
+            scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options) +
+            scoreFirstPeriodBalance(candidateState.classEntries);
           if (candidateScore >= currentScore) continue;
 
           if (!bestSwap || candidateScore < bestSwap.score) {
@@ -1204,7 +1255,9 @@ function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, setti
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
+    const currentScore =
+      scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options) +
+      scoreFirstPeriodBalance(currentState.classEntries);
     let bestSwap = null;
 
     for (const group of groups) {
@@ -1229,7 +1282,9 @@ function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, setti
           if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
           const candidateState = buildStateFromPlacements(candidatePlacements);
-          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
+          const candidateScore =
+            scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options) +
+            scoreFirstPeriodBalance(candidateState.classEntries);
           if (candidateScore >= currentScore) continue;
 
           if (!bestSwap || candidateScore < bestSwap.score) {
@@ -1261,7 +1316,9 @@ function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, sett
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
+    const currentScore =
+      scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options) +
+      scoreFirstPeriodBalance(currentState.classEntries);
     let bestSwap = null;
 
     for (const itemId of itemIds) {
@@ -1308,7 +1365,9 @@ function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, sett
             if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
             const candidateState = buildStateFromPlacements(candidatePlacements);
-            const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
+            const candidateScore =
+              scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options) +
+              scoreFirstPeriodBalance(candidateState.classEntries);
             if (candidateScore >= currentScore) continue;
 
             if (!bestSwap || candidateScore < bestSwap.score) {
