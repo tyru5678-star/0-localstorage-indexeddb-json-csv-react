@@ -653,26 +653,38 @@ function TeacherAvailabilityPanel({
 function SubjectsPage({ subjects, updateData }) {
   const blankSubject = { name: '', color: '#2f80ed', active: true };
   const [form, setForm] = React.useState(blankSubject);
+  const [editForm, setEditForm] = React.useState(blankSubject);
   const [editingId, setEditingId] = React.useState(null);
 
   const saveSubject = (event) => {
     event.preventDefault();
     if (!form.name.trim()) return;
 
-    if (editingId) {
-      updateData('subjects', subjects.map((subject) => (subject.id === editingId ? { ...subject, ...form } : subject)));
-    } else {
-      updateData('subjects', [...subjects, { id: createId(), ...form }]);
-    }
+    updateData('subjects', [...subjects, { id: createId(), ...form }]);
 
     setForm(blankSubject);
-    setEditingId(null);
   };
+
+  const openSubjectEdit = (subject) => {
+    setEditingId(subject.id);
+    setEditForm({ name: subject.name, color: subject.color, active: subject.active });
+  };
+
+  const saveSubjectEdit = (event) => {
+    event.preventDefault();
+    if (!editForm.name.trim()) return;
+
+    updateData('subjects', subjects.map((subject) => (subject.id === editingId ? { ...subject, ...editForm } : subject)));
+    setEditingId(null);
+    setEditForm(blankSubject);
+  };
+
+  const editingSubject = subjects.find((subject) => subject.id === editingId);
 
   return (
     <>
       <PageHeader title="교과 관리" description="과목명, 색상, 활성화 여부를 관리합니다." />
-      <CrudForm onSubmit={saveSubject} buttonText={editingId ? '교과 수정' : '교과 추가'}>
+      <CrudForm onSubmit={saveSubject} buttonText="교과 추가">
         <label>
           과목명
           <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="예: 음악" />
@@ -693,15 +705,38 @@ function SubjectsPage({ subjects, updateData }) {
               <span>{subject.active ? '활성' : '비활성'}</span>
             </div>
             <RowActions
-              onEdit={() => {
-                setEditingId(subject.id);
-                setForm({ name: subject.name, color: subject.color, active: subject.active });
-              }}
+              onEdit={() => openSubjectEdit(subject)}
               onDelete={() => updateData('subjects', subjects.filter((item) => item.id !== subject.id))}
             />
           </>
         )}
       />
+      {editingSubject ? (
+        <Modal title="교과 수정" onClose={() => setEditingId(null)}>
+          <form className="crud-form" onSubmit={saveSubjectEdit}>
+            <label>
+              과목명
+              <input
+                value={editForm.name}
+                onChange={(event) => setEditForm({ ...editForm, name: event.target.value })}
+                placeholder="예: 음악"
+              />
+            </label>
+            <label>
+              색상
+              <input
+                type="color"
+                value={editForm.color}
+                onChange={(event) => setEditForm({ ...editForm, color: event.target.value })}
+              />
+            </label>
+            <ToggleLabel checked={editForm.active} onChange={(checked) => setEditForm({ ...editForm, active: checked })} />
+            <button className="primary-button" type="submit">
+              교과 수정
+            </button>
+          </form>
+        </Modal>
+      ) : null}
     </>
   );
 }
