@@ -124,6 +124,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
       const item = detailItem.item;
       let stages = item.detailStages || createDefaultDetailStages(item, settings);
       const fixedClasses = item.fixedClasses || {};
+      const blockedClasses = item.blockedClasses || {};
       const classNumbers = [...(item.classNumbers || [])].sort((a, b) => a - b);
       const weeklyHours = Number(item.weeklyHours || 0);
 
@@ -146,6 +147,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
         item,
         stages,
         fixedClasses,
+        blockedClasses,
         classNumbers,
         weeklyHours,
         settings,
@@ -502,9 +504,18 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     dayCapacity,
     relaxedRules
   );
+  const crossItemBalancedPlacements = improveDayBalanceByCrossItemSwaps(
+    finalPlacements,
+    tasks,
+    lowLoadDays,
+    settings,
+    dayCapacity,
+    options,
+    relaxedRules
+  );
 
   return {
-    placements: finalPlacements,
+    placements: crossItemBalancedPlacements,
     lowLoadDays,
     dayCapacity,
     relaxedRules,
@@ -524,6 +535,19 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, optio
     a.candidates.length - b.candidates.length ||
     Number(b.item.continuous) - Number(a.item.continuous)
   );
+
+  const softSearch = searchBestEffortPlacement({
+    tasks: orderedTasks,
+    settings,
+    options,
+    canUse: canUseSoftCandidate,
+    onProgress,
+    phase: 'fallback',
+    message: '중요 규칙을 지키면서 가능한 시간표를 찾는 중입니다...',
+  });
+  if (softSearch.complete) {
+    return softSearch.placements;
+  }
 
   const walk = (taskIndex) => {
     if (Date.now() > deadline || searched >= maxSearch) return false;
@@ -562,21 +586,81 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, optio
 
   if (walk(0)) return [...state.placements];
 
+  const softGreedyPartial = constructGreedyBestEffortPlacement({
+    tasks: orderedTasks,
+    settings,
+    options,
+    canUse: canUseSoftCandidate,
+  });
+  const softBestPartial = softSearch.placements.length >= softGreedyPartial.length
+    ? softSearch.placements
+    : softGreedyPartial;
+  if (softBestPartial.length >= bestPartial.length) return softBestPartial;
+
   const greedyPartial = constructGreedyBestEffortPlacement({
     tasks: orderedTasks,
     settings,
     options,
+    canUse: canUseHardCandidate,
   });
 
   return greedyPartial.length > bestPartial.length ? greedyPartial : bestPartial;
 }
 
-function constructGreedyBestEffortPlacement({ tasks, settings, options = {} }) {
+function searchBestEffortPlacement({ tasks, settings, options = {}, canUse, onProgress = () => {}, phase, message }) {
+  const state = createPlacementState();
+  let bestPartial = [];
+  let searched = 0;
+  const maxSearch = 1200000;
+  const deadline = Date.now() + 18000;
+
+  const walk = (taskIndex) => {
+    if (state.placements.length > bestPartial.length) {
+      bestPartial = [...state.placements];
+    }
+    if (taskIndex === tasks.length) return true;
+    if (Date.now() > deadline || searched >= maxSearch) return false;
+
+    searched += 1;
+    if (searched % 5000 === 0) {
+      onProgress({
+        message,
+        phase,
+        searched,
+        percent: Math.min(88, 70 + Math.round((searched / maxSearch) * 18)),
+      });
+    }
+
+    const task = tasks[taskIndex];
+    const candidates = task.candidates
+      .filter((candidate) => canUse(candidate, state))
+      .sort((a, b) =>
+        scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries) -
+        scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries)
+      );
+
+    for (const candidate of candidates) {
+      applyPlacementToState(state, candidate);
+      if (walk(taskIndex + 1)) return true;
+      undoPlacementFromState(state, candidate);
+    }
+
+    return false;
+  };
+
+  const complete = walk(0);
+  return {
+    complete,
+    placements: complete ? [...state.placements] : bestPartial,
+  };
+}
+
+function constructGreedyBestEffortPlacement({ tasks, settings, options = {}, canUse }) {
   const state = createPlacementState();
 
   tasks.forEach((task) => {
     const candidate = task.candidates
-      .filter((option) => canUseHardCandidate(option, state))
+      .filter((option) => canUse(option, state))
       .sort((a, b) =>
         scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries) -
         scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries)
@@ -586,6 +670,24 @@ function constructGreedyBestEffortPlacement({ tasks, settings, options = {} }) {
   });
 
   return state.placements;
+}
+
+function canUseSoftCandidate(candidate, state) {
+  return candidate.slots.every((slot) => {
+    if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
+    if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
+    if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
+    if (getPlacementResourceKeys(candidate).some((resourceKey) =>
+      (state.occupiedResourceSlots[`${resourceKey}:${slot.key}`] || 0) >= getSlotCapacity(candidate, slot)
+    )) return false;
+    if (
+      !candidate.item.continuous &&
+      !hasOnlyOneAvailableDayForItem(candidate.item) &&
+      hasSameSubjectOnDay(state.classEntries[candidate.classNumber] || {}, candidate.detailItem, slot.day)
+    ) return false;
+    if (!candidate.item.continuous && hasAdjacentSameLesson(state.classEntries[candidate.classNumber] || {}, candidate.detailItem.id, slot)) return false;
+    return true;
+  });
 }
 
 function remainingHardTasksStillFeasible(tasks, startIndex, state) {
@@ -769,6 +871,7 @@ function findRelaxedContinuousAssignment(tasks, state) {
 function canUseRelaxedContinuousCandidate(candidate, state) {
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
+    if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
     if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
     return !getPlacementResourceKeys(candidate).some((resourceKey) =>
       (state.occupiedResourceSlots[`${resourceKey}:${slot.key}`] || 0) >= getSlotCapacity(candidate, slot)
@@ -963,6 +1066,7 @@ function clonePlacementState(state) {
 function canUseCandidate(candidate, state, lowLoadDays) {
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
+    if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
     if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
     if (getPlacementResourceKeys(candidate).some((resourceKey) =>
       (state.occupiedResourceSlots[`${resourceKey}:${slot.key}`] || 0) >= getSlotCapacity(candidate, slot)
@@ -981,6 +1085,7 @@ function canUseCandidate(candidate, state, lowLoadDays) {
 function canUseHardCandidate(candidate, state) {
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
+    if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
     if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
     return !getPlacementResourceKeys(candidate).some((resourceKey) =>
       (state.occupiedResourceSlots[`${resourceKey}:${slot.key}`] || 0) >= getSlotCapacity(candidate, slot)
@@ -1081,18 +1186,18 @@ function scoreDayBalance(classDayCounts, settings, dayCapacity, classEntries = {
       const actual = counts[day] || 0;
       const ideal = totalLessons * (periodsByDay[day] / totalPeriods);
       const diff = actual - ideal;
-      return score + diff * diff * 2600;
+      return score + diff * diff * 9000;
     }, 0);
 
     const sameCapacityScore = sameCapacityGroups.reduce((score, days) => {
       const values = days.map((day) => counts[day] || 0);
       const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-      return score + values.reduce((sum, value) => sum + (value - average) ** 2 * 12000, 0);
+      return score + values.reduce((sum, value) => sum + (value - average) ** 2 * 36000, 0);
     }, 0);
 
     const countsByDay = dayKeys.map((day) => counts[day] || 0);
     const maxDayCount = Math.max(...countsByDay);
-    const concentrationScore = Math.max(0, maxDayCount - Math.ceil(totalLessons / 3)) ** 2 * 18000;
+    const concentrationScore = Math.max(0, maxDayCount - Math.ceil(totalLessons / 3)) ** 2 * 60000;
 
     const adjacencyScore = scoreAdjacencyPreference(classEntries[classNumber] || {}, counts, options);
 
@@ -1110,7 +1215,7 @@ function scoreAdjacencyPreference(classSchedule, counts, options = {}) {
       .sort((a, b) => a - b);
     const adjacentPairs = periods.filter((period, index) => index > 0 && period - periods[index - 1] === 1).length;
 
-    return score + adjacentPairs * (options.groupSameDayLessons ? -9000 : 18000);
+    return score + adjacentPairs * (options.groupSameDayLessons ? -1200 : 2400);
   }, 0);
 }
 
@@ -1121,11 +1226,11 @@ function scoreFirstPeriodBalance(classEntries = {}) {
   if (counts.length === 0) return 0;
 
   const average = counts.reduce((sum, count) => sum + count, 0) / counts.length;
-  const spreadScore = counts.reduce((sum, count) => sum + (count - average) ** 2 * 26000, 0);
+  const spreadScore = counts.reduce((sum, count) => sum + (count - average) ** 2 * 7000, 0);
   const maxCount = Math.max(...counts);
   const minCount = Math.min(...counts);
 
-  return spreadScore + Math.max(0, maxCount - minCount - 1) ** 2 * 90000;
+  return spreadScore + Math.max(0, maxCount - minCount - 1) ** 2 * 22000;
 }
 
 function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
@@ -1390,6 +1495,87 @@ function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, sett
   return improved;
 }
 
+function improveDayBalanceByCrossItemSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules = false) {
+  let improved = [...placements];
+  let changed = true;
+  let rounds = 0;
+
+  while (changed && rounds < 40) {
+    changed = false;
+    rounds += 1;
+    const currentState = buildStateFromPlacements(improved);
+    const currentScore = scoreWholeSchedule(currentState, settings, dayCapacity, options);
+    let bestSwap = null;
+    const swappable = improved.filter((placement) =>
+      placement.slots.length === 1 &&
+      !placement.item.continuous &&
+      !hasFixedPlacement(placement)
+    );
+
+    for (let leftIndex = 0; leftIndex < swappable.length; leftIndex += 1) {
+      for (let rightIndex = leftIndex + 1; rightIndex < swappable.length; rightIndex += 1) {
+        const left = swappable[leftIndex];
+        const right = swappable[rightIndex];
+        if (left.classNumber === right.classNumber) continue;
+        if (left.slots[0].day === right.slots[0].day) continue;
+        if (getSubjectKey(left.detailItem) === getSubjectKey(right.detailItem)) continue;
+        if (sameStageTaskExists(improved, left.detailItem.id, left.slots[0].stage, right.classNumber)) continue;
+        if (sameStageTaskExists(improved, right.detailItem.id, right.slots[0].stage, left.classNumber)) continue;
+
+        const candidatePlacements = improved.map((placement) => {
+          if (placement.taskId === left.taskId) return { ...left, slots: right.slots };
+          if (placement.taskId === right.taskId) return { ...right, slots: left.slots };
+          return placement;
+        });
+        if (!placementMatchesOriginalCandidates(tasks, { ...left, slots: right.slots })) continue;
+        if (!placementMatchesOriginalCandidates(tasks, { ...right, slots: left.slots })) continue;
+        if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
+
+        const candidateState = buildStateFromPlacements(candidatePlacements);
+        const candidateScore = scoreWholeSchedule(candidateState, settings, dayCapacity, options);
+        if (candidateScore + 1 >= currentScore) continue;
+
+        if (!bestSwap || candidateScore < bestSwap.score) {
+          bestSwap = {
+            placements: candidatePlacements,
+            score: candidateScore,
+          };
+        }
+      }
+    }
+
+    if (bestSwap) {
+      improved = bestSwap.placements;
+      changed = true;
+    }
+  }
+
+  return improved;
+}
+
+function placementMatchesOriginalCandidates(tasks, placement) {
+  const task = tasks.find((candidateTask) => candidateTask.id === placement.taskId);
+  if (!task) return false;
+
+  return task.candidates.some((candidate) => slotsMatch(candidate.slots, placement.slots));
+}
+
+function slotsMatch(leftSlots, rightSlots) {
+  if (leftSlots.length !== rightSlots.length) return false;
+  const leftKeys = leftSlots.map((slot) => `${slot.key}:${slot.stage}`).sort();
+  const rightKeys = rightSlots.map((slot) => `${slot.key}:${slot.stage}`).sort();
+  return leftKeys.every((key, index) => key === rightKeys[index]);
+}
+
+function sameStageTaskExists(placements, detailItemId, stage, classNumber) {
+  if (!stage) return false;
+  return placements.some((placement) =>
+    placement.detailItem.id === detailItemId &&
+    placement.classNumber === classNumber &&
+    placement.slots[0]?.stage === stage
+  );
+}
+
 function getStageSubsets(stages) {
   const subsets = [];
   for (let mask = 1; mask < 2 ** stages.length; mask += 1) {
@@ -1627,8 +1813,8 @@ function scoreConstructiveCandidate(
     const adjacencyScore =
       !candidate.item.continuous && hasAdjacentLesson
         ? options.groupSameDayLessons
-          ? -9000
-          : 18000
+          ? -1200
+          : 2400
         : 0;
 
     return score + adjacencyScore + scoreDistributionForSlot({
@@ -1710,7 +1896,7 @@ function optimizeItemSchedule({
   });
 }
 
-function buildPlacementTasks({ schedule, detailItem, item, stages, fixedClasses, classNumbers, weeklyHours, settings }) {
+function buildPlacementTasks({ schedule, detailItem, item, stages, fixedClasses, blockedClasses = {}, classNumbers, weeklyHours, settings }) {
   if (item.continuous && weeklyHours > 1) {
     const chains = getContinuousChains(stages, weeklyHours, settings);
     return classNumbers.map((classNumber) => {
@@ -1720,6 +1906,7 @@ function buildPlacementTasks({ schedule, detailItem, item, stages, fixedClasses,
       const candidates = chains
         .filter((chain) => fixedSlotKeys.every((slotKey) => chain.some((slot) => slot.key === slotKey)))
         .filter((chain) => chain.every((slot) => !fixedClasses[slot.key] || fixedClasses[slot.key] === classNumber))
+        .filter((chain) => chain.every((slot) => !blockedClasses[slot.key]?.includes(classNumber)))
         .filter((chain) => canPlaceChain(schedule, classNumber, chain));
 
       return {
@@ -1745,6 +1932,7 @@ function buildPlacementTasks({ schedule, detailItem, item, stages, fixedClasses,
         : stageSlots
       )
         .filter((slot) => !fixedClasses[slot.key] || fixedClasses[slot.key] === classNumber)
+        .filter((slot) => !blockedClasses[slot.key]?.includes(classNumber))
         .filter((slot) => !schedule.classSchedules[classNumber]?.[slot.key]);
 
       return {

@@ -1346,6 +1346,7 @@ function WeeklyPlanSetup({ plan, data, updatePlan }) {
               settings={data.settings}
               onChange={(detailStages) => updateDetailItem(selectedDetailItem, { detailStages })}
               onFixedClassChange={(fixedClasses) => updateDetailItem(selectedDetailItem, { fixedClasses })}
+              onBlockedClassesChange={(blockedClasses) => updateDetailItem(selectedDetailItem, { blockedClasses })}
             />
           ) : null}
         </section>
@@ -1499,9 +1500,10 @@ function Modal({ title, children, onClose }) {
   );
 }
 
-function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedClassChange }) {
+function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedClassChange, onBlockedClassesChange }) {
   const stages = item.detailStages || createDefaultDetailStages(item, settings);
   const fixedClasses = item.fixedClasses || {};
+  const blockedClasses = item.blockedClasses || {};
   const [fixedSlotKey, setFixedSlotKey] = React.useState('');
   const maxPeriods = Math.max(...Object.values(settings.periodsByDay));
   const totalNeeded = (item.classNumbers?.length || 0) * Number(item.weeklyHours || 0);
@@ -1535,6 +1537,22 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
     setFixedSlotKey('');
   };
 
+  const toggleBlockedClass = (classNumber) => {
+    const currentBlocked = blockedClasses[fixedSlotKey] || [];
+    const nextBlockedForSlot = currentBlocked.includes(classNumber)
+      ? currentBlocked.filter((value) => value !== classNumber)
+      : [...currentBlocked, classNumber].sort((a, b) => a - b);
+    const nextBlockedClasses = { ...blockedClasses };
+
+    if (nextBlockedForSlot.length === 0) {
+      delete nextBlockedClasses[fixedSlotKey];
+    } else {
+      nextBlockedClasses[fixedSlotKey] = nextBlockedForSlot;
+    }
+
+    onBlockedClassesChange(nextBlockedClasses);
+  };
+
   const fixedSlotLabel = fixedSlotKey ? formatSlotKey(fixedSlotKey) : '';
 
   return (
@@ -1565,7 +1583,9 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
                 {Object.keys(dayLabels).map((day) => {
                   const isUsablePeriod = period <= settings.periodsByDay[day];
                   const isAvailable = (item.availableSlots?.[day] || []).includes(period);
-                  const stage = stages[createSlotKey(day, period)];
+                  const slotKey = createSlotKey(day, period);
+                  const stage = stages[slotKey];
+                  const blockedCount = blockedClasses[slotKey]?.length || 0;
 
                   return (
                     <td key={`${day}-${period}`}>
@@ -1573,6 +1593,9 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
                         <div className={stage ? `stage-cell stage-${stage}` : 'stage-cell empty'}>
                           <button type="button" className="stage-main-button" onClick={() => cycleStage(day, period)}>
                             <span>{stage ? `${stage}차시` : '비어 있음'}</span>
+                            {blockedCount > 0 ? (
+                              <small>{blockedCount}개 반 제외</small>
+                            ) : null}
                             {fixedClasses[createSlotKey(day, period)] ? (
                               <small>{fixedClasses[createSlotKey(day, period)]}반 고정</small>
                             ) : null}
@@ -1580,7 +1603,7 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
                           <button
                             type="button"
                             className="stage-menu-button"
-                            onClick={() => setFixedSlotKey(createSlotKey(day, period))}
+                            onClick={() => setFixedSlotKey(slotKey)}
                             aria-label="반 고정 설정"
                           >
                             ...
@@ -1598,21 +1621,42 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
         </table>
       </div>
       {fixedSlotKey ? (
-        <Modal title={`${fixedSlotLabel} 반 고정`} onClose={() => setFixedSlotKey('')}>
-          <div className="fixed-class-picker">
-            <button className="secondary-button" type="button" onClick={() => setFixedClass(null)}>
-              고정 안 함
-            </button>
-            {(item.classNumbers || []).map((classNumber) => (
-              <button
-                key={classNumber}
-                className={fixedClasses[fixedSlotKey] === classNumber ? 'primary-button' : 'secondary-button'}
-                type="button"
-                onClick={() => setFixedClass(classNumber)}
-              >
-                {classNumber}반 고정
-              </button>
-            ))}
+        <Modal title={`${fixedSlotLabel} 반 설정`} onClose={() => setFixedSlotKey('')}>
+          <div className="slot-class-settings">
+            <section>
+              <h3>고정 반</h3>
+              <div className="fixed-class-picker">
+                <button className="secondary-button" type="button" onClick={() => setFixedClass(null)}>
+                  고정 없음
+                </button>
+                {(item.classNumbers || []).map((classNumber) => (
+                  <button
+                    key={classNumber}
+                    className={fixedClasses[fixedSlotKey] === classNumber ? 'primary-button' : 'secondary-button'}
+                    type="button"
+                    onClick={() => setFixedClass(classNumber)}
+                  >
+                    {classNumber}반 고정
+                  </button>
+                ))}
+              </div>
+            </section>
+            <section>
+              <h3>배정 제외 반</h3>
+              <div className="fixed-class-picker">
+                {(item.classNumbers || []).map((classNumber) => (
+                  <button
+                    key={classNumber}
+                    className={blockedClasses[fixedSlotKey]?.includes(classNumber) ? 'primary-button' : 'secondary-button'}
+                    type="button"
+                    onClick={() => toggleBlockedClass(classNumber)}
+                    disabled={fixedClasses[fixedSlotKey] === classNumber}
+                  >
+                    {classNumber}반 제외
+                  </button>
+                ))}
+              </div>
+            </section>
           </div>
         </Modal>
       ) : null}

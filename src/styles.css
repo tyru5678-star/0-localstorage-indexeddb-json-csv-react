@@ -953,6 +953,16 @@ input[type="color"] {
   gap: 8px;
 }
 
+.slot-class-settings {
+  display: grid;
+  gap: 18px;
+}
+
+.slot-class-settings h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+
 .step-actions {
   display: flex;
   justify-content: flex-end;
