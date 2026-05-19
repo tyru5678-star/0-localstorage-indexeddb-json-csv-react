@@ -735,6 +735,19 @@ input[type="color"] {
   min-width: 92px;
 }
 
+.compact-options-panel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+}
+
+.compact-options-panel p {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

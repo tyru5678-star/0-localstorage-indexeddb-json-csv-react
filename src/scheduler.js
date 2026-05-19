@@ -97,6 +97,9 @@ function formatDateTime(value) {
 }
 
 function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => {}) {
+  const generationOptions = {
+    groupSameDayLessons: Boolean(plan.options?.groupSameDayLessons),
+  };
   onProgress({
     message: '수업 정보를 정리하는 중입니다...',
     phase: 'prepare',
@@ -160,6 +163,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
     tasks: balancedTasks,
     settings,
     totalClassCount: settings.classCount,
+    options: generationOptions,
     onProgress,
   });
   onProgress({
@@ -285,12 +289,13 @@ function recordPlacementCounts(placements, classDayCounts, classPeriodCounts, fi
   });
 }
 
-function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSparseSeed = true, onProgress = () => {} }) {
+function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSparseSeed = true, options = {}, onProgress = () => {} }) {
   if (tasks.some((task) => task.item.continuous)) {
     const continuousFirst = constructWithContinuousCandidates({
       tasks,
       settings,
       totalClassCount,
+      options,
       onProgress,
     });
     if (continuousFirst) {
@@ -300,6 +305,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
         lowLoadDays: continuousFirst.lowLoadDays,
         dayCapacity: continuousFirst.dayCapacity,
         settings,
+        options,
       });
     }
   }
@@ -327,7 +333,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
     if (groupIndex === stageGroups.length) {
       const candidate = {
         placements: [...state.placements],
-        score: scoreWholeSchedule(state, settings, dayCapacity),
+        score: scoreWholeSchedule(state, settings, dayCapacity, options),
       };
       if (!best || candidate.score < best.score) best = candidate;
       return;
@@ -349,12 +355,13 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
       lowLoadDays,
       settings,
       dayCapacity,
+      options,
       limit: group.tasks.length <= 1 ? 40 : 4000,
     });
 
     groupAssignments.forEach((assignment) => {
       applyGroupAssignment(state, assignment);
-      if (remainingGroupsStillFeasible(stageGroups, groupIndex + 1, state, lowLoadDays, settings, dayCapacity)) {
+      if (remainingGroupsStillFeasible(stageGroups, groupIndex + 1, state, lowLoadDays, settings, dayCapacity, options)) {
         walk(groupIndex + 1);
       }
       undoGroupAssignment(state, assignment);
@@ -369,6 +376,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
       settings,
       totalClassCount,
       useSparseSeed: false,
+      options,
       onProgress,
     });
   }
@@ -380,11 +388,12 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
       lowLoadDays,
       settings,
       dayCapacity,
+      options,
     });
     if (greedyPlacements) {
       best = {
         placements: greedyPlacements,
-        score: scoreWholeSchedule(buildStateFromPlacements(greedyPlacements), settings, dayCapacity),
+        score: scoreWholeSchedule(buildStateFromPlacements(greedyPlacements), settings, dayCapacity, options),
       };
     }
   }
@@ -394,6 +403,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
       tasks,
       settings,
       totalClassCount,
+      options,
       onProgress,
     });
     if (relaxedPlacements) {
@@ -403,6 +413,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
         lowLoadDays,
         dayCapacity,
         settings,
+        options,
         relaxedRules: true,
       });
     }
@@ -413,6 +424,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
       tasks,
       settings,
       totalClassCount,
+      options,
       onProgress,
     });
     if (anyFeasiblePlacements) {
@@ -422,6 +434,7 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
         lowLoadDays,
         dayCapacity,
         settings,
+        options,
         relaxedRules: true,
       });
     }
@@ -433,11 +446,12 @@ function constructHumanStylePlacements({ tasks, settings, totalClassCount, useSp
     lowLoadDays,
     dayCapacity,
     settings,
+    options,
     relaxedRules: false,
   });
 }
 
-function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, settings, relaxedRules = false }) {
+function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, settings, options = {}, relaxedRules = false }) {
   const balancedPlacements = rebalanceEqualCapacityDays(
     placements,
     tasks,
@@ -451,6 +465,7 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     lowLoadDays,
     settings,
     dayCapacity,
+    options,
     relaxedRules
   );
   const improvedPlacements = improvePlacementsBySameStageSwaps(
@@ -459,6 +474,7 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     lowLoadDays,
     settings,
     dayCapacity,
+    options,
     relaxedRules
   );
   const dayBalancedPlacements = improveDayBalanceBySameStageSwaps(
@@ -467,6 +483,7 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     lowLoadDays,
     settings,
     dayCapacity,
+    options,
     relaxedRules
   );
   const bundleBalancedPlacements = improveDayBalanceByMultiStageSwaps(
@@ -475,6 +492,7 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     lowLoadDays,
     settings,
     dayCapacity,
+    options,
     relaxedRules
   );
   const finalPlacements = rebalanceEqualCapacityDays(
@@ -493,7 +511,7 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
   };
 }
 
-function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, onProgress = () => {} }) {
+function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, options = {}, onProgress = () => {} }) {
   const lowLoadDays = [...getLowLoadDays(tasks, totalClassCount)].sort(
     (a, b) => countDayResourceSlots(tasks, a) - countDayResourceSlots(tasks, b)
   );
@@ -523,8 +541,8 @@ function constructAnyFeasiblePlacement({ tasks, settings, totalClassCount, onPro
     const candidates = task.candidates
       .filter((candidate) => canUseHardCandidate(candidate, state))
       .sort((a, b) =>
-        scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings) -
-        scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings)
+        scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries) -
+        scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries)
       );
 
     for (const candidate of candidates) {
@@ -547,7 +565,7 @@ function remainingHardTasksStillFeasible(tasks, startIndex, state) {
   );
 }
 
-function constructWithContinuousCandidates({ tasks, settings, totalClassCount, onProgress = () => {} }) {
+function constructWithContinuousCandidates({ tasks, settings, totalClassCount, options = {}, onProgress = () => {} }) {
   const continuousTasks = tasks.filter((task) => task.item.continuous);
   const regularTasks = tasks.filter((task) => !task.item.continuous);
   const continuousGroups = buildStageGroups(continuousTasks, [], new Set());
@@ -576,10 +594,11 @@ function constructWithContinuousCandidates({ tasks, settings, totalClassCount, o
       settings,
       totalClassCount,
       initialState: state,
+      options,
     });
     if (!regularResult || regularResult.placements.length !== regularTasks.length + seedPlacements.length) continue;
 
-    const score = scoreWholeSchedule(buildStateFromPlacements(regularResult.placements), settings, regularResult.dayCapacity);
+    const score = scoreWholeSchedule(buildStateFromPlacements(regularResult.placements), settings, regularResult.dayCapacity, options);
     if (!best || score < best.score) {
       best = {
         placements: regularResult.placements,
@@ -599,7 +618,7 @@ function constructWithContinuousCandidates({ tasks, settings, totalClassCount, o
     : null;
 }
 
-function constructFromInitialState({ tasks, settings, totalClassCount, initialState }) {
+function constructFromInitialState({ tasks, settings, totalClassCount, initialState, options = {} }) {
   const lowLoadDays = [...getLowLoadDays(tasks, totalClassCount)].sort(
     (a, b) => countDayResourceSlots(tasks, a) - countDayResourceSlots(tasks, b)
   );
@@ -612,6 +631,7 @@ function constructFromInitialState({ tasks, settings, totalClassCount, initialSt
     lowLoadDays,
     settings,
     dayCapacity,
+    options,
   });
   if (!placements) return null;
   return { placements, lowLoadDays, dayCapacity };
@@ -670,7 +690,7 @@ function enumerateRelaxedContinuousAssignments(tasks, state, limit) {
   return results;
 }
 
-function constructRelaxedContinuousFallback({ tasks, settings, totalClassCount, onProgress = () => {} }) {
+function constructRelaxedContinuousFallback({ tasks, settings, totalClassCount, options = {}, onProgress = () => {} }) {
   const regularTasks = tasks.filter((task) => !task.item.continuous);
   const continuousTasks = tasks.filter((task) => task.item.continuous);
   if (continuousTasks.length === 0) return null;
@@ -679,6 +699,7 @@ function constructRelaxedContinuousFallback({ tasks, settings, totalClassCount, 
     tasks: regularTasks,
     settings,
     totalClassCount,
+    options,
     onProgress,
   });
   if (regularResult.placements.length !== regularTasks.length) return null;
@@ -726,7 +747,7 @@ function canUseRelaxedContinuousCandidate(candidate, state) {
   });
 }
 
-function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, settings, dayCapacity }) {
+function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, settings, dayCapacity, options = {} }) {
   const state = clonePlacementState(initialState);
 
   for (const group of stageGroups) {
@@ -736,6 +757,7 @@ function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, sett
       lowLoadDays,
       settings,
       dayCapacity,
+      options,
       limit: group.tasks.length <= 1 ? 40 : 1000,
     });
     const assignment = assignments.find((candidate) => {
@@ -746,7 +768,8 @@ function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, sett
         state,
         lowLoadDays,
         settings,
-        dayCapacity
+        dayCapacity,
+        options
       );
       undoGroupAssignment(state, candidate);
       return feasible;
@@ -836,7 +859,7 @@ function createPlacementState() {
   };
 }
 
-function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCapacity, limit }) {
+function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCapacity, options = {}, limit }) {
   const results = [];
   const chosen = [];
   const usedTaskIds = new Set();
@@ -847,7 +870,7 @@ function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCap
     if (index === group.tasks.length) {
       results.push({
         placements: [...chosen],
-        score: scoreWholeSchedule(tempState, settings, dayCapacity),
+        score: scoreWholeSchedule(tempState, settings, dayCapacity, options),
       });
       return;
     }
@@ -856,8 +879,8 @@ function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCap
     const candidates = task.candidates
       .filter((candidate) => canUseCandidate(candidate, tempState, lowLoadDays))
       .sort((a, b) =>
-        scoreConstructiveCandidate(a, tempState.classDayCounts, tempState.classPeriodCounts, tempState.firstPeriodCounts, settings) -
-        scoreConstructiveCandidate(b, tempState.classDayCounts, tempState.classPeriodCounts, tempState.firstPeriodCounts, settings)
+        scoreConstructiveCandidate(a, tempState.classDayCounts, tempState.classPeriodCounts, tempState.firstPeriodCounts, settings, options, tempState.classEntries) -
+        scoreConstructiveCandidate(b, tempState.classDayCounts, tempState.classPeriodCounts, tempState.firstPeriodCounts, settings, options, tempState.classEntries)
       );
 
     for (const candidate of candidates) {
@@ -880,7 +903,7 @@ function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCap
     .map((result) => result.placements);
 }
 
-function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, settings, dayCapacity) {
+function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, settings, dayCapacity, options = {}) {
   return groups.slice(startIndex).every((group) =>
     enumerateGroupAssignments({
       group,
@@ -888,6 +911,7 @@ function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, se
       lowLoadDays,
       settings,
       dayCapacity,
+      options,
       limit: 1,
     }).length > 0
   );
@@ -986,7 +1010,7 @@ function undoPlacementFromState(state, placement) {
   });
 }
 
-function scoreWholeSchedule(state, settings, dayCapacity) {
+function scoreWholeSchedule(state, settings, dayCapacity, options = {}) {
   const placementScore = state.placements.reduce(
     (score, placement) =>
       score + scoreConstructiveCandidate(
@@ -994,14 +1018,16 @@ function scoreWholeSchedule(state, settings, dayCapacity) {
         state.classDayCounts,
         state.classPeriodCounts,
         state.firstPeriodCounts,
-        settings
+        settings,
+        options,
+        state.classEntries
       ),
     0
   );
-  return placementScore + scoreDayBalance(state.classDayCounts, settings, dayCapacity);
+  return placementScore + scoreDayBalance(state.classDayCounts, settings, dayCapacity, state.classEntries, options);
 }
 
-function scoreDayBalance(classDayCounts, settings, dayCapacity) {
+function scoreDayBalance(classDayCounts, settings, dayCapacity, classEntries = {}, options = {}) {
   const dayKeys = Object.keys(dayLabels);
   const periodsByDay = settings.periodsByDay;
   const totalPeriods = Object.values(periodsByDay).reduce((sum, count) => sum + count, 0);
@@ -1014,7 +1040,7 @@ function scoreDayBalance(classDayCounts, settings, dayCapacity) {
     }, {})
   ).filter((days) => days.length > 1);
 
-  return Object.values(classDayCounts).reduce((totalScore, counts) => {
+  return Object.entries(classDayCounts).reduce((totalScore, [classNumber, counts]) => {
     const totalLessons = countClassLessons(counts);
     if (totalLessons === 0) return totalScore;
 
@@ -1035,11 +1061,27 @@ function scoreDayBalance(classDayCounts, settings, dayCapacity) {
     const maxDayCount = Math.max(...countsByDay);
     const concentrationScore = Math.max(0, maxDayCount - Math.ceil(totalLessons / 3)) ** 2 * 18000;
 
-    return totalScore + dayScore + sameCapacityScore + concentrationScore;
+    const adjacencyScore = scoreAdjacencyPreference(classEntries[classNumber] || {}, counts, options);
+
+    return totalScore + dayScore + sameCapacityScore + concentrationScore + adjacencyScore;
   }, 0);
 }
 
-function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, relaxedRules) {
+function scoreAdjacencyPreference(classSchedule, counts, options = {}) {
+  return Object.keys(dayLabels).reduce((score, day) => {
+    if ((counts[day] || 0) < 2) return score;
+
+    const periods = Object.keys(classSchedule)
+      .filter((slotKey) => slotKey.startsWith(`${day}-`))
+      .map((slotKey) => Number(slotKey.split('-')[1]))
+      .sort((a, b) => a - b);
+    const adjacentPairs = periods.filter((period, index) => index > 0 && period - periods[index - 1] === 1).length;
+
+    return score + adjacentPairs * (options.groupSameDayLessons ? -9000 : 18000);
+  }, 0);
+}
+
+function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
   const continuousItemIds = [...new Set(
     tasks
       .filter((task) => task.item.continuous)
@@ -1053,7 +1095,7 @@ function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, sett
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity);
+    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
     let bestSwap = null;
 
     for (const itemId of continuousItemIds) {
@@ -1078,7 +1120,7 @@ function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, sett
           if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
           const candidateState = buildStateFromPlacements(candidatePlacements);
-          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity);
+          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
           if (candidateScore >= currentScore) continue;
 
           if (!bestSwap || candidateScore < bestSwap.score) {
@@ -1100,7 +1142,7 @@ function improveDayBalanceByContinuousSwaps(placements, tasks, lowLoadDays, sett
   return improved;
 }
 
-function improvePlacementsBySameStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, relaxedRules) {
+function improvePlacementsBySameStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
   const groups = buildStageGroups(tasks, lowLoadDays);
   const groupByKey = new Map(groups.map((group) => [group.key, group]));
   let improved = [...placements];
@@ -1137,8 +1179,8 @@ function improvePlacementsBySameStageSwaps(placements, tasks, lowLoadDays, setti
           const candidateState = buildStateFromPlacements(candidatePlacements);
           if (worsensEqualCapacityBalance(currentState.classDayCounts, candidateState.classDayCounts, dayCapacity)) continue;
 
-          const currentScore = scoreWholeSchedule(currentState, settings, dayCapacity);
-          const candidateScore = scoreWholeSchedule(candidateState, settings, dayCapacity);
+          const currentScore = scoreWholeSchedule(currentState, settings, dayCapacity, options);
+          const candidateScore = scoreWholeSchedule(candidateState, settings, dayCapacity, options);
           if (candidateScore + 1 < currentScore) {
             improved = candidatePlacements;
             changed = true;
@@ -1152,7 +1194,7 @@ function improvePlacementsBySameStageSwaps(placements, tasks, lowLoadDays, setti
   return improved;
 }
 
-function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, relaxedRules) {
+function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
   const groups = buildStageGroups(tasks, lowLoadDays);
   let improved = [...placements];
   let changed = true;
@@ -1162,7 +1204,7 @@ function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, setti
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity);
+    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
     let bestSwap = null;
 
     for (const group of groups) {
@@ -1187,7 +1229,7 @@ function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, setti
           if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
           const candidateState = buildStateFromPlacements(candidatePlacements);
-          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity);
+          const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
           if (candidateScore >= currentScore) continue;
 
           if (!bestSwap || candidateScore < bestSwap.score) {
@@ -1209,7 +1251,7 @@ function improveDayBalanceBySameStageSwaps(placements, tasks, lowLoadDays, setti
   return improved;
 }
 
-function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, relaxedRules) {
+function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules) {
   const itemIds = [...new Set(tasks.map((task) => task.detailItem.id))];
   let improved = [...placements];
   let changed = true;
@@ -1219,7 +1261,7 @@ function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, sett
     changed = false;
     rounds += 1;
     const currentState = buildStateFromPlacements(improved);
-    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity);
+    const currentScore = scoreDayBalance(currentState.classDayCounts, settings, dayCapacity, currentState.classEntries, options);
     let bestSwap = null;
 
     for (const itemId of itemIds) {
@@ -1266,7 +1308,7 @@ function improveDayBalanceByMultiStageSwaps(placements, tasks, lowLoadDays, sett
             if (!allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) continue;
 
             const candidateState = buildStateFromPlacements(candidatePlacements);
-            const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity);
+            const candidateScore = scoreDayBalance(candidateState.classDayCounts, settings, dayCapacity, candidateState.classEntries, options);
             if (candidateScore >= currentScore) continue;
 
             if (!bestSwap || candidateScore < bestSwap.score) {
@@ -1510,10 +1552,27 @@ function violatesConstructiveDayRule(candidate, lowLoadDays, classDayCounts) {
   );
 }
 
-function scoreConstructiveCandidate(candidate, classDayCounts, classPeriodCounts, firstPeriodCounts, settings) {
+function scoreConstructiveCandidate(
+  candidate,
+  classDayCounts,
+  classPeriodCounts,
+  firstPeriodCounts,
+  settings,
+  options = {},
+  classEntries = {}
+) {
   return candidate.slots.reduce((score, slot) => {
-    const classSchedule = {};
-    return score + scoreDistributionForSlot({
+    const classSchedule = classEntries[candidate.classNumber] || {};
+    const dayCount = classDayCounts[candidate.classNumber]?.[slot.day] || 0;
+    const hasAdjacentLesson = dayCount > 0 && hasAdjacentAnyLesson(classSchedule, slot);
+    const adjacencyScore =
+      !candidate.item.continuous && hasAdjacentLesson
+        ? options.groupSameDayLessons
+          ? -9000
+          : 18000
+        : 0;
+
+    return score + adjacencyScore + scoreDistributionForSlot({
       classSchedule,
       classDayCounts,
       classPeriodCounts,

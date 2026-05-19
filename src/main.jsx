@@ -511,6 +511,9 @@ function createPlanFromCurrentSettings(startDate, data) {
     id: createId(),
     startDate,
     memo: '',
+    options: {
+      groupSameDayLessons: false,
+    },
     planAssignments: data.assignments
       .filter((assignment) => assignment.active)
       .map((assignment) => createPlanAssignment(assignment, data)),
@@ -1026,6 +1029,18 @@ function WeeklyPlanSetup({ plan, data, updatePlan }) {
     setDraftSchedule(null);
   };
 
+  const updatePlanOptions = (patch) => {
+    updatePlan((currentPlan) => ({
+      ...currentPlan,
+      options: {
+        ...(currentPlan.options || {}),
+        ...patch,
+      },
+      generatedSchedule: undefined,
+    }));
+    setDraftSchedule(null);
+  };
+
   const deleteOneTimeLesson = (lessonId) => {
     updatePlan((currentPlan) => ({
       ...currentPlan,
@@ -1163,6 +1178,14 @@ function WeeklyPlanSetup({ plan, data, updatePlan }) {
 
       {setupStep === 'basic' ? (
         <>
+          <div className="panel compact-options-panel">
+            <ToggleLabel
+              checked={Boolean(plan.options?.groupSameDayLessons)}
+              onChange={(checked) => updatePlanOptions({ groupSameDayLessons: checked })}
+              label="전담시간끼리 붙이기"
+            />
+            <p>체크하면 같은 날 한 반에 전담 수업이 2시간 이상 있을 때 가능한 한 연속되게 배치합니다.</p>
+          </div>
           <div className="setup-grid">
             {planAssignments.length === 0 ? (
               <EmptyState text="이 계획에 들어온 교과 배정이 없습니다. 먼저 교과 배정을 등록해주세요." />
