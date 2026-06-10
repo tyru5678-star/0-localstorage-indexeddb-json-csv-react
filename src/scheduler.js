@@ -60,21 +60,29 @@ function hasEnoughContinuousChains(stages, item, settings) {
   const weeklyHours = Number(item.weeklyHours || 0);
   if (!item.continuous || weeklyHours <= 1) return true;
 
-  let chainCount = 0;
+  let classCapacity = 0;
 
   Object.keys(dayLabels).forEach((day) => {
     for (let period = 1; period <= settings.periodsByDay[day]; period += 1) {
-      const hasChain = Array.from({ length: weeklyHours }, (_, index) => period + index).every(
-        (chainPeriod, index) =>
-          chainPeriod <= settings.periodsByDay[day] &&
-          stages[createSlotKey(day, chainPeriod)] === index + 1
+      const chainSlots = Array.from({ length: weeklyHours }, (_, index) => ({
+        key: createSlotKey(day, period + index),
+        period: period + index,
+      }));
+      const hasChain = chainSlots.every(
+        (slot, index) =>
+          slot.period <= settings.periodsByDay[day] &&
+          stages[slot.key] === index + 1
       );
 
-      if (hasChain) chainCount += 1;
+      if (hasChain) {
+        classCapacity += Math.min(
+          ...chainSlots.map((slot) => Math.max(1, Number(item.slotCapacities?.[slot.key] || 1)))
+        );
+      }
     }
   });
 
-  return chainCount >= classCount;
+  return classCapacity >= classCount;
 }
 
 function createSlotKey(day, period) {
@@ -107,7 +115,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
   });
   const schedule = {
     generatedAt: new Date().toISOString(),
-    generationVersion: '2026-05-17-any-feasible-fallback-v1',
+    generationVersion: '2026-06-10-continuous-capacity-timebox-v1',
     classSchedules: {},
     itemSchedules: {},
     warnings: [],
@@ -700,14 +708,17 @@ function constructWithContinuousCandidates({ tasks, settings, totalClassCount, o
   const continuousTasks = tasks.filter((task) => task.item.continuous);
   const regularTasks = tasks.filter((task) => !task.item.continuous);
   const continuousGroups = buildStageGroups(continuousTasks, [], new Set());
-  const continuousAssignments = enumerateContinuousGroupCandidates(continuousGroups, 300);
+  const deadline = Date.now() + 14000;
+  const continuousAssignments = enumerateContinuousGroupCandidates(continuousGroups, 48, deadline);
   let best = null;
 
-  for (const seedPlacements of continuousAssignments) {
+  for (let seedIndex = 0; seedIndex < continuousAssignments.length; seedIndex += 1) {
+    if (Date.now() > deadline) break;
+    const seedPlacements = continuousAssignments[seedIndex];
     onProgress({
       message: '연차시 묶음을 포함한 조합을 확인하는 중입니다...',
       phase: 'continuous',
-      percent: 18,
+      percent: Math.min(45, 18 + Math.round((seedIndex / Math.max(continuousAssignments.length, 1)) * 27)),
     });
     const state = createPlacementState();
     let validSeed = true;
@@ -726,6 +737,7 @@ function constructWithContinuousCandidates({ tasks, settings, totalClassCount, o
       totalClassCount,
       initialState: state,
       options,
+      deadline: Math.min(deadline, Date.now() + 1200),
     });
     if (!regularResult || regularResult.placements.length !== regularTasks.length + seedPlacements.length) continue;
 
@@ -749,7 +761,7 @@ function constructWithContinuousCandidates({ tasks, settings, totalClassCount, o
     : null;
 }
 
-function constructFromInitialState({ tasks, settings, totalClassCount, initialState, options = {} }) {
+function constructFromInitialState({ tasks, settings, totalClassCount, initialState, options = {}, deadline = Infinity }) {
   const lowLoadDays = [...getLowLoadDays(tasks, totalClassCount)].sort(
     (a, b) => countDayResourceSlots(tasks, a) - countDayResourceSlots(tasks, b)
   );
@@ -763,26 +775,29 @@ function constructFromInitialState({ tasks, settings, totalClassCount, initialSt
     settings,
     dayCapacity,
     options,
+    deadline,
+    assignmentLimit: 180,
   });
   if (!placements) return null;
   return { placements, lowLoadDays, dayCapacity };
 }
 
-function enumerateContinuousGroupCandidates(groups, limit) {
+function enumerateContinuousGroupCandidates(groups, limit, deadline = Infinity) {
   const results = [];
   const chosen = [];
   const state = createPlacementState();
 
   const walk = (index) => {
-    if (results.length >= limit) return;
+    if (results.length >= limit || Date.now() > deadline) return;
     if (index === groups.length) {
       results.push([...chosen]);
       return;
     }
 
     const group = groups[index];
-    const assignments = enumerateRelaxedContinuousAssignments(group.tasks, state, limit - results.length);
+    const assignments = enumerateRelaxedContinuousAssignments(group.tasks, state, limit - results.length, deadline);
     assignments.forEach((assignment) => {
+      if (Date.now() > deadline) return;
       applyGroupAssignment(state, assignment);
       chosen.push(...assignment);
       walk(index + 1);
@@ -795,19 +810,27 @@ function enumerateContinuousGroupCandidates(groups, limit) {
   return results;
 }
 
-function enumerateRelaxedContinuousAssignments(tasks, state, limit) {
+function enumerateRelaxedContinuousAssignments(tasks, state, limit, deadline = Infinity) {
   const results = [];
   const chosen = [];
   const tempState = clonePlacementState(state);
 
   const walk = (index) => {
-    if (results.length >= limit) return;
+    if (results.length >= limit || Date.now() > deadline) return;
     if (index === tasks.length) {
       results.push([...chosen]);
       return;
     }
     const task = tasks[index];
-    for (const candidate of task.candidates) {
+    const offset = task.candidates.length > 0
+      ? (Math.max(1, Number(task.classNumber || 1)) - 1) % task.candidates.length
+      : 0;
+    const orderedCandidates = [
+      ...task.candidates.slice(offset),
+      ...task.candidates.slice(0, offset),
+    ];
+    for (const candidate of orderedCandidates) {
+      if (Date.now() > deadline) break;
       if (!canUseRelaxedContinuousCandidate(candidate, tempState)) continue;
       applyPlacementToState(tempState, candidate);
       chosen.push(candidate);
@@ -879,10 +902,20 @@ function canUseRelaxedContinuousCandidate(candidate, state) {
   });
 }
 
-function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, settings, dayCapacity, options = {} }) {
+function constructGreedyPlacement({
+  stageGroups,
+  initialState,
+  lowLoadDays,
+  settings,
+  dayCapacity,
+  options = {},
+  deadline = Infinity,
+  assignmentLimit = 1000,
+}) {
   const state = clonePlacementState(initialState);
 
   for (const group of stageGroups) {
+    if (Date.now() > deadline) return null;
     const assignments = enumerateGroupAssignments({
       group,
       state,
@@ -890,7 +923,8 @@ function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, sett
       settings,
       dayCapacity,
       options,
-      limit: group.tasks.length <= 1 ? 40 : 1000,
+      limit: group.tasks.length <= 1 ? 40 : assignmentLimit,
+      deadline,
     });
     const assignment = assignments.find((candidate) => {
       applyGroupAssignment(state, candidate);
@@ -901,7 +935,8 @@ function constructGreedyPlacement({ stageGroups, initialState, lowLoadDays, sett
         lowLoadDays,
         settings,
         dayCapacity,
-        options
+        options,
+        deadline
       );
       undoGroupAssignment(state, candidate);
       return feasible;
@@ -991,14 +1026,14 @@ function createPlacementState() {
   };
 }
 
-function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCapacity, options = {}, limit }) {
+function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCapacity, options = {}, limit, deadline = Infinity }) {
   const results = [];
   const chosen = [];
   const usedTaskIds = new Set();
   const tempState = clonePlacementState(state);
 
   const walk = (index) => {
-    if (results.length >= limit) return;
+    if (results.length >= limit || Date.now() > deadline) return;
     if (index === group.tasks.length) {
       results.push({
         placements: [...chosen],
@@ -1016,6 +1051,7 @@ function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCap
       );
 
     for (const candidate of candidates) {
+      if (Date.now() > deadline) break;
       if (usedTaskIds.has(candidate.taskId)) continue;
       chosen.push(candidate);
       usedTaskIds.add(candidate.taskId);
@@ -1035,7 +1071,8 @@ function enumerateGroupAssignments({ group, state, lowLoadDays, settings, dayCap
     .map((result) => result.placements);
 }
 
-function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, settings, dayCapacity, options = {}) {
+function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, settings, dayCapacity, options = {}, deadline = Infinity) {
+  if (Date.now() > deadline) return false;
   return groups.slice(startIndex).every((group) =>
     enumerateGroupAssignments({
       group,
@@ -1045,6 +1082,7 @@ function remainingGroupsStillFeasible(groups, startIndex, state, lowLoadDays, se
       dayCapacity,
       options,
       limit: 1,
+      deadline,
     }).length > 0
   );
 }
