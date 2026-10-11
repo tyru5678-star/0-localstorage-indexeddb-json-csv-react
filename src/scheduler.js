@@ -115,7 +115,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
   });
   const schedule = {
     generatedAt: new Date().toISOString(),
-    generationVersion: '2026-06-10-continuous-capacity-timebox-v1',
+    generationVersion: '2026-10-11-relocation-chain-balance-v1',
     classSchedules: {},
     itemSchedules: {},
     warnings: [],
@@ -521,9 +521,18 @@ function finalizePlacements({ placements, tasks, lowLoadDays, dayCapacity, setti
     options,
     relaxedRules
   );
+  const chainBalancedPlacements = improveDayBalanceByRelocationChains(
+    crossItemBalancedPlacements,
+    tasks,
+    lowLoadDays,
+    settings,
+    dayCapacity,
+    options,
+    relaxedRules
+  );
 
   return {
-    placements: crossItemBalancedPlacements,
+    placements: chainBalancedPlacements,
     lowLoadDays,
     dayCapacity,
     relaxedRules,
@@ -1236,10 +1245,16 @@ function scoreDayBalance(classDayCounts, settings, dayCapacity, classEntries = {
     const countsByDay = dayKeys.map((day) => counts[day] || 0);
     const maxDayCount = Math.max(...countsByDay);
     const concentrationScore = Math.max(0, maxDayCount - Math.ceil(totalLessons / 3)) ** 2 * 60000;
+    const missingUsableDayScore = dayKeys.reduce((score, day) => {
+      const actual = counts[day] || 0;
+      const ideal = totalLessons * (periodsByDay[day] / totalPeriods);
+      const enoughDayCapacity = (dayCapacity[day] || 0) >= Math.min(settings.classCount || 0, totalLessons);
+      return score + (actual === 0 && ideal >= 0.75 && enoughDayCapacity ? 140000 : 0);
+    }, 0);
 
     const adjacencyScore = scoreAdjacencyPreference(classEntries[classNumber] || {}, counts, options);
 
-    return totalScore + dayScore + sameCapacityScore + concentrationScore + adjacencyScore;
+    return totalScore + dayScore + sameCapacityScore + concentrationScore + missingUsableDayScore + adjacencyScore;
   }, 0);
 }
 
@@ -1589,6 +1604,317 @@ function improveDayBalanceByCrossItemSwaps(placements, tasks, lowLoadDays, setti
   }
 
   return improved;
+}
+
+function improveDayBalanceByRelocationChains(placements, tasks, lowLoadDays, settings, dayCapacity, options = {}, relaxedRules = false) {
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  let improved = [...placements];
+  let rounds = 0;
+  const deadline = Date.now() + 9000;
+
+  while (rounds < 8 && Date.now() < deadline) {
+    rounds += 1;
+    const currentState = buildStateFromPlacements(improved);
+    const currentScore = scoreWholeSchedule(currentState, settings, dayCapacity, options);
+    const currentMissing = countMissingUsableDays(currentState, settings, dayCapacity);
+    const targetMoves = getRelocationTargets(improved, tasks, currentState, settings, dayCapacity, options)
+      .slice(0, 80);
+    let bestMove = null;
+
+    for (const target of targetMoves) {
+      if (Date.now() > deadline) break;
+      const candidatePlacements = findRelocationChain({
+        basePlacements: improved,
+        tasks,
+        taskMap,
+        initialPlacement: target.placement,
+        initialCandidate: target.candidate,
+        lowLoadDays,
+        settings,
+        dayCapacity,
+        options,
+        relaxedRules,
+        deadline,
+      });
+      if (!candidatePlacements) continue;
+
+      const candidateState = buildStateFromPlacements(candidatePlacements);
+      const candidateScore = scoreWholeSchedule(candidateState, settings, dayCapacity, options);
+      const candidateMissing = countMissingUsableDays(candidateState, settings, dayCapacity);
+      if (currentMissing > 0) {
+        if (candidateMissing >= currentMissing) continue;
+      } else if (candidateScore + 1 >= currentScore) {
+        continue;
+      }
+
+      if (
+        !bestMove ||
+        candidateMissing < bestMove.missing ||
+        (candidateMissing === bestMove.missing && candidateScore < bestMove.score)
+      ) {
+        bestMove = {
+          placements: candidatePlacements,
+          score: candidateScore,
+          missing: candidateMissing,
+        };
+      }
+    }
+
+    if (!bestMove) break;
+    improved = bestMove.placements;
+  }
+
+  return improved;
+}
+
+function getRelocationTargets(placements, tasks, state, settings, dayCapacity, options = {}) {
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  const targets = [];
+
+  placements.forEach((placement) => {
+    if (!canRelocatePlacement(placement)) return;
+    const currentSlot = placement.slots[0];
+    const currentDayCount = state.classDayCounts[placement.classNumber]?.[currentSlot.day] || 0;
+    const task = taskMap.get(placement.taskId);
+    if (!task) return;
+
+    task.candidates.forEach((candidate) => {
+      if (candidate.slots.length !== 1) return;
+      if (slotsMatch(candidate.slots, placement.slots)) return;
+      const targetSlot = candidate.slots[0];
+      const targetDayCount = state.classDayCounts[placement.classNumber]?.[targetSlot.day] || 0;
+      if (targetDayCount >= currentDayCount) return;
+
+      const targetDayCapacity = dayCapacity[targetSlot.day] || 0;
+      if (targetDayCapacity <= 0) return;
+
+      const dayGain = currentDayCount - targetDayCount;
+      const emptyDayBonus = targetDayCount === 0 ? 12000 : 0;
+      const lowPeriodPenalty = targetSlot.period === 1 ? (state.firstPeriodCounts[placement.classNumber] || 0) * 300 : 0;
+      const candidateScore = scoreConstructiveCandidate(
+        candidate,
+        state.classDayCounts,
+        state.classPeriodCounts,
+        state.firstPeriodCounts,
+        settings,
+        options,
+        state.classEntries
+      );
+
+      targets.push({
+        placement,
+        candidate,
+        priority: emptyDayBonus + dayGain * 5000 - candidateScore - lowPeriodPenalty,
+      });
+    });
+  });
+
+  return targets.sort((a, b) => b.priority - a.priority);
+}
+
+function countMissingUsableDays(state, settings, dayCapacity) {
+  return Object.entries(state.classDayCounts).reduce((total, [, counts]) => {
+    const totalLessons = countClassLessons(counts);
+    if (totalLessons === 0) return total;
+
+    const dayCount = Object.keys(dayLabels).filter((day) => {
+      const periodsByDay = settings.periodsByDay;
+      const totalPeriods = Object.values(periodsByDay).reduce((sum, count) => sum + count, 0);
+      const ideal = totalLessons * (periodsByDay[day] / totalPeriods);
+      const enoughDayCapacity = (dayCapacity[day] || 0) >= Math.min(settings.classCount || 0, totalLessons);
+      return (counts[day] || 0) === 0 && ideal >= 0.75 && enoughDayCapacity;
+    }).length;
+
+    return total + dayCount;
+  }, 0);
+}
+
+function findRelocationChain({
+  basePlacements,
+  tasks,
+  taskMap,
+  initialPlacement,
+  initialCandidate,
+  lowLoadDays,
+  settings,
+  dayCapacity,
+  options,
+  relaxedRules,
+  deadline,
+}) {
+  const replacements = new Map([[initialPlacement.taskId, initialCandidate]]);
+  const visited = new Set();
+  let searched = 0;
+  let bestValid = null;
+  const maxSearch = 4000;
+  const maxDepth = 9;
+
+  const walk = (depth) => {
+    if (Date.now() > deadline || searched >= maxSearch || depth > maxDepth) return;
+    searched += 1;
+
+    const signature = getReplacementSignature(replacements);
+    if (visited.has(signature)) return;
+    visited.add(signature);
+
+    const candidatePlacements = applyReplacementMap(basePlacements, replacements);
+    if (allPlacementsRemainValid(candidatePlacements, lowLoadDays, relaxedRules)) {
+      const candidateState = buildStateFromPlacements(candidatePlacements);
+      const candidateScore = scoreWholeSchedule(candidateState, settings, dayCapacity, options);
+      const candidateMissing = countMissingUsableDays(candidateState, settings, dayCapacity);
+      if (
+        !bestValid ||
+        candidateMissing < bestValid.missing ||
+        (candidateMissing === bestValid.missing && candidateScore < bestValid.score)
+      ) {
+        bestValid = {
+          placements: candidatePlacements,
+          score: candidateScore,
+          missing: candidateMissing,
+        };
+      }
+      return;
+    }
+
+    const conflict = findFirstPlacementConflict(candidatePlacements, lowLoadDays, relaxedRules);
+    if (!conflict) return;
+
+    const victims = conflict
+      .filter((placement) => canRelocatePlacement(placement))
+      .sort((a, b) => Number(replacements.has(a.taskId)) - Number(replacements.has(b.taskId)))
+      .slice(0, 4);
+
+    for (const victim of victims) {
+      const task = taskMap.get(victim.taskId);
+      if (!task) continue;
+      const victimCandidates = getRelocationCandidatesForVictim(task, victim, candidatePlacements, settings, options)
+        .slice(0, 14);
+
+      for (const nextCandidate of victimCandidates) {
+        const previous = replacements.get(victim.taskId);
+        replacements.set(victim.taskId, nextCandidate);
+        walk(depth + 1);
+        if (previous) {
+          replacements.set(victim.taskId, previous);
+        } else {
+          replacements.delete(victim.taskId);
+        }
+      }
+    }
+  };
+
+  walk(0);
+  return bestValid?.placements || null;
+}
+
+function getRelocationCandidatesForVictim(task, victim, currentPlacements, settings, options = {}) {
+  const currentState = buildStateFromPlacements(
+    currentPlacements.filter((placement) => placement.taskId !== victim.taskId)
+  );
+
+  return task.candidates
+    .filter((candidate) => candidate.slots.length === victim.slots.length)
+    .filter((candidate) => !slotsMatch(candidate.slots, victim.slots))
+    .sort((a, b) =>
+      scoreConstructiveCandidate(
+        a,
+        currentState.classDayCounts,
+        currentState.classPeriodCounts,
+        currentState.firstPeriodCounts,
+        settings,
+        options,
+        currentState.classEntries
+      ) -
+      scoreConstructiveCandidate(
+        b,
+        currentState.classDayCounts,
+        currentState.classPeriodCounts,
+        currentState.firstPeriodCounts,
+        settings,
+        options,
+        currentState.classEntries
+      )
+    );
+}
+
+function applyReplacementMap(placements, replacements) {
+  return placements.map((placement) => replacements.get(placement.taskId) || placement);
+}
+
+function getReplacementSignature(replacements) {
+  return [...replacements.entries()]
+    .map(([taskId, placement]) => `${taskId}:${placement.slots.map((slot) => `${slot.key}:${slot.stage}`).join(',')}`)
+    .sort()
+    .join('|');
+}
+
+function canRelocatePlacement(placement) {
+  return (
+    placement.slots.length === 1 &&
+    !placement.item.continuous &&
+    !hasFixedPlacement(placement)
+  );
+}
+
+function findFirstPlacementConflict(placements, lowLoadDays, relaxedRules = false) {
+  const classSlotMap = new Map();
+  const resourceSlotMap = new Map();
+  const subjectDayMap = new Map();
+  const itemDayMap = new Map();
+  const lowLoadDayMap = new Map();
+
+  for (const placement of placements) {
+    for (const slot of placement.slots) {
+      pushMapValue(classSlotMap, `${placement.classNumber}:${slot.key}`, placement);
+      getPlacementResourceKeys(placement).forEach((resourceKey) => {
+        pushMapValue(resourceSlotMap, `${resourceKey}:${slot.key}`, placement);
+      });
+      if (!placement.item.continuous && !hasOnlyOneAvailableDayForItem(placement.item)) {
+        pushMapValue(subjectDayMap, `${placement.classNumber}:${getSubjectKey(placement.detailItem)}:${slot.day}`, placement);
+      }
+      if (!placement.item.continuous) {
+        pushMapValue(itemDayMap, `${placement.classNumber}:${placement.detailItem.id}:${slot.day}`, placement);
+      }
+      if (!relaxedRules && lowLoadDays.includes(slot.day)) {
+        pushMapValue(lowLoadDayMap, `${placement.classNumber}:${slot.day}`, placement);
+      }
+    }
+  }
+
+  for (const group of classSlotMap.values()) {
+    if (group.length > 1) return group;
+  }
+
+  for (const group of resourceSlotMap.values()) {
+    const capacity = Math.min(...group.flatMap((placement) =>
+      placement.slots.map((slot) => getSlotCapacity(placement, slot))
+    ));
+    if (group.length > capacity) return group;
+  }
+
+  for (const group of subjectDayMap.values()) {
+    if (group.length > 1) return group;
+  }
+
+  for (const group of itemDayMap.values()) {
+    const sorted = [...group].sort((a, b) => a.slots[0].period - b.slots[0].period);
+    for (let index = 1; index < sorted.length; index += 1) {
+      if (sorted[index].slots[0].period - sorted[index - 1].slots[0].period === 1) {
+        return [sorted[index - 1], sorted[index]];
+      }
+    }
+  }
+
+  for (const group of lowLoadDayMap.values()) {
+    if (group.length > 1) return group.filter(canRelocatePlacement);
+  }
+
+  return null;
+}
+
+function pushMapValue(map, key, value) {
+  if (!map.has(key)) map.set(key, []);
+  map.get(key).push(value);
 }
 
 function placementMatchesOriginalCandidates(tasks, placement) {
