@@ -1230,6 +1230,7 @@ function WeeklyPlanSetup({ plan, data, updatePlan }) {
                   key={assignment.id}
                   title={getSubjectName(assignment.subjectId)}
                   subtitle={getTeacherNames(assignment.teacherIds)}
+                  color={getSubjectColor(assignment.subjectId)}
                   item={assignment}
                   classNumbers={classNumbers}
                   settings={data.settings}
@@ -1394,7 +1395,7 @@ function SavedSchedulePanel({ plan, settings, onBackToSetup }) {
   );
 }
 
-function PlanAssignmentCard({ title, subtitle, item, showColor = false, classNumbers, settings, onChange, onDelete }) {
+function PlanAssignmentCard({ title, subtitle, color, item, showColor = false, classNumbers, settings, onChange, onDelete }) {
   const [modal, setModal] = React.useState('');
 
   return (
@@ -1402,6 +1403,7 @@ function PlanAssignmentCard({ title, subtitle, item, showColor = false, classNum
       <div className="setup-main">
         <div className="setup-title">
           <div className="setup-title-row">
+            {color ? <span className="setup-color-dot" style={{ background: color }} aria-hidden="true" /> : null}
             <h3>{title}</h3>
             {showColor ? (
               <button className="icon-button" type="button" onClick={() => setModal('name')} aria-label="교과명 수정">
