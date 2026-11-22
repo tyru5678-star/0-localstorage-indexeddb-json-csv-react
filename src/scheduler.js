@@ -1,3 +1,5 @@
+import { getContinuousStageGroups } from './continuous.js';
+
 const dayLabels = {
   mon: '월',
   tue: '화',
@@ -115,7 +117,7 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
   });
   const schedule = {
     generatedAt: new Date().toISOString(),
-    generationVersion: '2026-10-11-capacity-day-balance-v2',
+    generationVersion: '2026-11-22-explicit-continuous-v6',
     classSchedules: {},
     itemSchedules: {},
     warnings: [],
@@ -145,11 +147,10 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
         slots: {},
       };
 
-      if (item.continuous && !hasEnoughContinuousChains(stages, item, settings)) {
-        stages = createDefaultDetailStages({ ...item, detailStages: undefined }, settings);
-      }
+      // An explicit stage table may intentionally split 1-2 and 3 across days.
+      // Never replace it merely because there is no full-week continuous chain.
 
-      allTasks.push(...buildPlacementTasks({
+      allTasks.push(...bundleUnavoidableTasks(buildPlacementTasks({
         schedule,
         detailItem,
         item,
@@ -159,32 +160,62 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
         classNumbers,
         weeklyHours,
         settings,
-      }));
+      })));
     });
 
-  const balancedTasks = allTasks.filter((task) => !task.item.flexiblePlacement);
-  const flexibleTasks = allTasks.filter((task) => task.item.flexiblePlacement);
+  // Reserve lessons with no alternative before any balancing/search. An
+  // indivisible multi-hour lesson takes precedence over a duplicate singleton.
+  const reservedState = createPlacementState();
+  const unavoidableTasks = allTasks.filter((task) => task.unavoidable)
+    .sort((a, b) => b.candidates[0].slots.length - a.candidates[0].slots.length);
+  for (const task of unavoidableTasks) {
+    const candidate = task.candidates[0];
+    if (canUseCandidate(candidate, reservedState, [])) applyPlacementToState(reservedState, candidate);
+  }
+  const reservedPlacements = [...reservedState.placements];
+  const remainingTasks = allTasks.filter((task) => !task.unavoidable).map((task) => ({
+    ...task,
+    candidates: task.candidates.filter((candidate) => canUseCandidate(candidate, reservedState, [])),
+  }));
+  const balancedTasks = remainingTasks.filter((task) => !task.item.flexiblePlacement);
+  const flexibleTasks = remainingTasks.filter((task) => task.item.flexiblePlacement);
   onProgress({
     message: '가능한 시간표 조합을 찾는 중입니다...',
     phase: 'search',
     percent: 12,
   });
   const constructiveResult = constructHumanStylePlacements({
-    tasks: balancedTasks,
+    tasks: balancedTasks.filter((task) => task.candidates.length > 0),
     settings,
     totalClassCount: settings.classCount,
     options: generationOptions,
     onProgress,
   });
+  const balanceTasks = [...unavoidableTasks, ...balancedTasks];
+  const lowLoadDays = [...getLowLoadDays(balanceTasks, settings.classCount)];
+  const dayCapacity = getDayResourceSlotCounts(balanceTasks);
+  const balancedResult = reservedPlacements.length > 0 ? finalizePlacements({
+    placements: [...reservedPlacements, ...constructiveResult.placements],
+    tasks: balanceTasks, lowLoadDays, dayCapacity, settings,
+    options: generationOptions, relaxedRules: constructiveResult.relaxedRules,
+  }) : constructiveResult;
   onProgress({
     message: '빈 시간 배치와 마지막 정리를 하는 중입니다...',
     phase: 'finalize',
     percent: 92,
   });
-  const flexiblePlacements = placeFlexibleTasks(flexibleTasks, constructiveResult.placements);
-  const allPlacements = [...constructiveResult.placements, ...flexiblePlacements];
-  schedule.lowLoadDays = constructiveResult.lowLoadDays;
-  schedule.dayCapacity = constructiveResult.dayCapacity;
+  const completedPlacements = completeMissingPlacements({
+    tasks: balancedTasks,
+    placements: balancedResult.placements,
+    lowLoadDays,
+    settings,
+    dayCapacity,
+    options: generationOptions,
+  });
+  const flexiblePlacements = placeFlexibleTasks(flexibleTasks, completedPlacements);
+  const allPlacements = [...completedPlacements, ...flexiblePlacements];
+  schedule.lowLoadDays = lowLoadDays;
+  schedule.dayCapacity = dayCapacity;
   schedule.relaxedRules = Boolean(constructiveResult.relaxedRules);
   applyPlacementsToSchedule(schedule, allPlacements);
 
@@ -200,7 +231,100 @@ function generateWeeklySchedule(plan, detailItems, settings, onProgress = () => 
   return schedule;
 }
 
+// Balance improvements can open slots after a partial search result was chosen.
+// Always saturate those slots before declaring a task unplaced. Repair only
+// commits when every displaced task has also been restored to a legal candidate.
+function completeMissingPlacements({ tasks, placements, lowLoadDays, settings, dayCapacity, options = {}, repairMilliseconds = 2000 }) {
+  let result = [...placements];
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const deadline = Date.now() + repairMilliseconds;
+  let searched = 0;
+  const canUse = (candidate, state) => canUseCandidate(candidate, state, lowLoadDays);
+  const missingTasks = () => {
+    const placed = new Set(result.map((placement) => placement.taskId));
+    return tasks.filter((task) => !placed.has(task.id))
+      .sort((a, b) => a.candidates.length - b.candidates.length);
+  };
+  const rank = (task, state) => [...task.candidates].sort((a, b) =>
+    scoreConstructiveCandidate(a, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries, dayCapacity) -
+    scoreConstructiveCandidate(b, state.classDayCounts, state.classPeriodCounts, state.firstPeriodCounts, settings, options, state.classEntries, dayCapacity)
+  );
+  const fillFreeSlots = () => {
+    const state = buildStateFromPlacements(result);
+    let changed;
+    do {
+      changed = false;
+      for (const task of missingTasks()) {
+        const candidate = rank(task, state).find((option) => canUse(option, state));
+        if (!candidate) continue;
+        applyPlacementToState(state, candidate);
+        result.push(candidate);
+        changed = true;
+      }
+    } while (changed);
+  };
+
+  const restore = (pending, current, locked, remainingMoves) => {
+    if (++searched > 20000 || Date.now() >= deadline) return null;
+    if (pending.length === 0) return current;
+    const [task, ...rest] = pending;
+    const state = buildStateFromPlacements(current);
+    for (const candidate of rank(task, state)) {
+      if (canUse(candidate, state)) {
+        const next = restore(rest, [...current, candidate], new Set([...locked, task.id]), remainingMoves);
+        if (next) return next;
+      } else if (remainingMoves > 0) {
+        // Only lessons sharing the class/day or a resource/slot can block this
+        // candidate. Try removing one or two, then restore them recursively.
+        const resources = getPlacementResourceKeys(candidate);
+        const nearby = current.filter((placement) => !locked.has(placement.taskId) &&
+          taskById.has(placement.taskId) && !hasFixedPlacement(placement) &&
+          placement.slots.some((slot) => candidate.slots.some((target) =>
+            (placement.classNumber === candidate.classNumber && slot.day === target.day) ||
+            (slot.key === target.key && getPlacementResourceKeys(placement).some((key) => resources.includes(key)))
+          )));
+        const removals = nearby.map((placement) => [placement]);
+        if (remainingMoves >= 2) {
+          nearby.forEach((left, index) => nearby.slice(index + 1).forEach((right) => removals.push([left, right])));
+        }
+        for (const removed of removals) {
+          if (searched > 20000 || Date.now() >= deadline) return null;
+          const ids = new Set(removed.map((placement) => placement.taskId));
+          const kept = current.filter((placement) => !ids.has(placement.taskId));
+          if (!canUse(candidate, buildStateFromPlacements(kept))) continue;
+          const next = restore(
+            [...removed.map((placement) => taskById.get(placement.taskId)), ...rest],
+            [...kept, candidate], new Set([...locked, task.id]), remainingMoves - removed.length
+          );
+          if (next) return next;
+        }
+      }
+    }
+    return null;
+  };
+
+  fillFreeSlots();
+  let improved;
+  do {
+    improved = false;
+    for (const task of missingTasks()) {
+      const repaired = restore([task], result, new Set(), 3);
+      if (!repaired || !allPlacementsRemainValid(repaired, lowLoadDays)) continue;
+      result = repaired;
+      fillFreeSlots();
+      improved = true;
+    }
+  } while (improved && Date.now() < deadline);
+  // This pass is deliberately outside the bounded relocation search: a time
+  // limit must never leave a directly usable candidate unfilled.
+  fillFreeSlots();
+  return result;
+}
+
 function getUnplacedTaskWarning(task) {
+  if (task.unavoidable) {
+    return `${task.detailItem.title}: ${task.classNumber}반의 지정 시간(${task.candidates[0].slots.map((slot) => formatSlotKey(slot.key)).join(', ')})이 다른 수업 또는 배정 금지 조건과 충돌해 배정하지 못했습니다.`;
+  }
   if (!task.item.continuous && Number(task.item.weeklyHours || 0) > 1 && hasOnlyOneAvailableDay(task)) {
     return `${task.detailItem.title}: ${task.classNumber}반은 같은 날에만 ${task.item.weeklyHours}차시가 가능해 예외 규칙을 적용해야 합니다.`;
   }
@@ -277,6 +401,7 @@ function placeFlexibleTasks(tasks, existingPlacements) {
 }
 
 function canUseFlexibleCandidate(candidate, state) {
+  if (conflictsWithSeparateStageGroup(candidate, state)) return false;
   return candidate.slots.every((slot) => {
     if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
     return !getPlacementResourceKeys(candidate).some((resourceKey) =>
@@ -712,6 +837,8 @@ function constructGreedyBestEffortPlacement({ tasks, settings, options = {}, day
 }
 
 function canUseSoftCandidate(candidate, state, lowLoadDays = []) {
+  if (candidate.unavoidable) return canUseUnavoidableCandidate(candidate, state);
+  if (conflictsWithSeparateStageGroup(candidate, state)) return false;
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
     if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
@@ -924,6 +1051,7 @@ function findRelaxedContinuousAssignment(tasks, state) {
 }
 
 function canUseRelaxedContinuousCandidate(candidate, state) {
+  if (conflictsWithSeparateStageGroup(candidate, state)) return false;
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
     if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
@@ -1133,7 +1261,26 @@ function clonePlacementState(state) {
   };
 }
 
+function canUseUnavoidableCandidate(candidate, state) {
+  return candidate.slots.every((slot) => {
+    if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
+    if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
+    if (state.occupiedClassSlots.has(`${candidate.classNumber}:${slot.key}`)) return false;
+    return !getPlacementResourceKeys(candidate).some((resourceKey) =>
+      (state.occupiedResourceSlots[`${resourceKey}:${slot.key}`] || 0) >= getSlotCapacity(candidate, slot)
+    );
+  });
+}
+
+function conflictsWithSeparateStageGroup(candidate, state) {
+  return candidate.item.separateStageGroups && candidate.slots.some((slot) =>
+    hasSameSubjectOnDay(state.classEntries[candidate.classNumber] || {}, candidate.detailItem, slot.day)
+  );
+}
+
 function canUseCandidate(candidate, state, lowLoadDays) {
+  if (candidate.unavoidable) return canUseUnavoidableCandidate(candidate, state);
+  if (conflictsWithSeparateStageGroup(candidate, state)) return false;
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
     if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
@@ -1153,6 +1300,8 @@ function canUseCandidate(candidate, state, lowLoadDays) {
 }
 
 function canUseHardCandidate(candidate, state, lowLoadDays = []) {
+  if (candidate.unavoidable) return canUseUnavoidableCandidate(candidate, state);
+  if (conflictsWithSeparateStageGroup(candidate, state)) return false;
   return candidate.slots.every((slot) => {
     if (candidate.item.fixedClasses?.[slot.key] && candidate.item.fixedClasses[slot.key] !== candidate.classNumber) return false;
     if (candidate.item.blockedClasses?.[slot.key]?.includes(candidate.classNumber)) return false;
@@ -2211,6 +2360,7 @@ function findFirstPlacementConflict(placements, lowLoadDays, relaxedRules = fals
       getPlacementResourceKeys(placement).forEach((resourceKey) => {
         pushMapValue(resourceSlotMap, `${resourceKey}:${slot.key}`, placement);
       });
+      if (placement.unavoidable) continue;
       if (!placement.item.continuous && !hasOnlyOneAvailableDayForItem(placement.item)) {
         pushMapValue(subjectDayMap, `${placement.classNumber}:${getSubjectKey(placement.detailItem)}:${slot.day}`, placement);
       }
@@ -2299,7 +2449,7 @@ function worsensEqualCapacityBalance(beforeCounts, afterCounts, dayCapacity) {
 }
 
 function hasFixedPlacement(placement) {
-  return placement.slots.some((slot) => Boolean(placement.item.fixedClasses?.[slot.key]));
+  return Boolean(placement.unavoidable) || placement.slots.some((slot) => Boolean(placement.item.fixedClasses?.[slot.key]));
 }
 
 function rebalanceEqualCapacityDays(placements, tasks, lowLoadDays, dayCapacity, relaxedRules = false) {
@@ -2607,28 +2757,57 @@ function optimizeItemSchedule({
   });
 }
 
+function bundleUnavoidableTasks(tasks) {
+  const byClass = new Map();
+  tasks.forEach((task) => {
+    if (!byClass.has(task.classNumber)) byClass.set(task.classNumber, []);
+    byClass.get(task.classNumber).push(task);
+  });
+  return [...byClass.values()].flatMap((classTasks) => {
+    if (!classTasks.every((task) => task.candidates.length === 1)) return classTasks;
+    const slots = classTasks.flatMap((task) => task.candidates[0].slots);
+    if (new Set(slots.map((slot) => slot.key)).size !== Number(classTasks[0].item.weeklyHours)) return classTasks;
+    const first = classTasks[0];
+    const id = `${first.detailItem.id}:${first.classNumber}:unavoidable`;
+    return [{
+      ...first, id, stage: undefined, unavoidable: true,
+      label: `${first.classNumber}반 지정 시간`,
+      candidates: [{ ...first.candidates[0], taskId: id, unavoidable: true, slots }],
+    }];
+  });
+}
+
 function buildPlacementTasks({ schedule, detailItem, item, stages, fixedClasses, blockedClasses = {}, classNumbers, weeklyHours, settings }) {
   if (item.continuous && weeklyHours > 1) {
-    const chains = getContinuousChains(stages, weeklyHours, settings);
-    return classNumbers.map((classNumber) => {
+    const groups = getContinuousStageGroups(stages, weeklyHours, settings, item.continuousLinks);
+    return groups.flatMap((groupStages) => classNumbers.map((classNumber) => {
+      const isContinuous = groupStages.length > 1;
+      const groupItem = { ...item, continuous: isContinuous, separateStageGroups: groups.length > 1 };
+      const chains = isContinuous
+        ? getContinuousChains(stages, groupStages.length, settings, groupStages)
+        : getStageSlots(stages, groupStages[0], settings).map((slot) => [{ ...slot, stage: groupStages[0] }]);
       const fixedSlotKeys = Object.entries(fixedClasses)
-        .filter(([, fixedClass]) => fixedClass === classNumber)
+        .filter(([slotKey, fixedClass]) => fixedClass === classNumber && groupStages.includes(stages[slotKey]))
         .map(([slotKey]) => slotKey);
       const candidates = chains
         .filter((chain) => fixedSlotKeys.every((slotKey) => chain.some((slot) => slot.key === slotKey)))
         .filter((chain) => chain.every((slot) => !fixedClasses[slot.key] || fixedClasses[slot.key] === classNumber))
         .filter((chain) => chain.every((slot) => !blockedClasses[slot.key]?.includes(classNumber)))
-        .filter((chain) => canPlaceChain(schedule, classNumber, chain));
+        .filter((chain) => chain.every((slot) => (item.availableSlots?.[slot.day] || []).includes(slot.period)))
+        .filter((chain) => canPlaceChain(schedule, classNumber, chain))
+        .map((chain) => chain.map((slot) => ({ ...slot, continuous: isContinuous })));
+      const id = `${detailItem.id}:${classNumber}:${isContinuous ? `continuous-${groupStages.join('-')}` : groupStages[0]}`;
 
       return {
-        id: `${detailItem.id}:${classNumber}:continuous`,
-        label: `${classNumber}반 연차시`,
+        id,
+        label: `${classNumber}반 ${groupStages.join('·')}차시${isContinuous ? ' 연차시' : ''}`,
         detailItem,
-        item,
+        item: groupItem,
         classNumber,
-        candidates: candidates.map((chain) => ({ taskId: `${detailItem.id}:${classNumber}:continuous`, detailItem, item, classNumber, slots: chain })),
+        stage: isContinuous ? undefined : groupStages[0],
+        candidates: candidates.map((chain) => ({ taskId: id, detailItem, item: groupItem, classNumber, slots: chain })),
       };
-    });
+    }));
   }
 
   return classNumbers.flatMap((classNumber) =>
@@ -3100,14 +3279,14 @@ function findDistinctDayReplacement(dayPlacements, tasks, allPlacements, day) {
   return walk(0) ? chosen : null;
 }
 
-function getContinuousChains(stages, weeklyHours, settings) {
+function getContinuousChains(stages, weeklyHours, settings, stageNumbers = Array.from({ length: weeklyHours }, (_, index) => index + 1)) {
   const chains = [];
 
   Object.keys(dayLabels).forEach((day) => {
     for (let period = 1; period <= settings.periodsByDay[day]; period += 1) {
       const chain = Array.from({ length: weeklyHours }, (_, index) => {
         const chainPeriod = period + index;
-        return { day, period: chainPeriod, key: createSlotKey(day, chainPeriod), order: 0, stage: index + 1 };
+        return { day, period: chainPeriod, key: createSlotKey(day, chainPeriod), order: 0, stage: stageNumbers[index] };
       });
       const hasChain = chain.every(
         (slot) => slot.period <= settings.periodsByDay[day] && stages[slot.key] === slot.stage
@@ -3291,7 +3470,7 @@ function placeLesson(schedule, itemSchedule, classDayCounts, classPeriodCounts, 
     classNumber,
     itemId: detailItem.id,
     subjectKey: getSubjectKey(detailItem),
-    continuous: Boolean(item.continuous),
+    continuous: slot.continuous ?? Boolean(item.continuous),
   };
 
   schedule.classSchedules[classNumber][slot.key] = entry;

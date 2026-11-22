@@ -1,5 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import { getContinuousStageGroups } from './continuous.js';
 import {
   BookOpen,
   CalendarDays,
@@ -1348,6 +1349,10 @@ function WeeklyPlanSetup({ plan, data, updatePlan }) {
               onChange={(detailStages) => updateDetailItem(selectedDetailItem, { detailStages })}
               onFixedClassChange={(fixedClasses) => updateDetailItem(selectedDetailItem, { fixedClasses })}
               onBlockedClassesChange={(blockedClasses) => updateDetailItem(selectedDetailItem, { blockedClasses })}
+              onContinuousLinksChange={(continuousLinks) => updateDetailItem(selectedDetailItem, {
+                continuousLinks,
+                detailStages: selectedDetailItem.item.detailStages || createDefaultDetailStages(selectedDetailItem.item, data.settings),
+              })}
             />
           ) : null}
         </section>
@@ -1502,8 +1507,10 @@ function Modal({ title, children, onClose }) {
   );
 }
 
-function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedClassChange, onBlockedClassesChange }) {
+function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedClassChange, onBlockedClassesChange, onContinuousLinksChange }) {
   const stages = item.detailStages || createDefaultDetailStages(item, settings);
+  const continuousGroups = getContinuousStageGroups(stages, Number(item.weeklyHours), settings, item.continuousLinks);
+  const selectedLinks = continuousGroups.flatMap((group) => group.slice(0, -1));
   const fixedClasses = item.fixedClasses || {};
   const blockedClasses = item.blockedClasses || {};
   const [fixedSlotKey, setFixedSlotKey] = React.useState('');
@@ -1568,6 +1575,20 @@ function DetailStageTable({ title, subtitle, item, settings, onChange, onFixedCl
           {formatClassSummary(item.classNumbers)} · 주 {item.weeklyHours}차시 · 필요 {totalNeeded}칸 · 가능 {availableCount}칸
         </span>
       </div>
+      {item.continuous && Number(item.weeklyHours) > 1 ? (
+        <fieldset>
+          <legend>연차시로 묶을 차시</legend>
+          {Array.from({ length: Number(item.weeklyHours) - 1 }, (_, index) => index + 1).map((stage) => (
+            <ToggleLabel key={stage} label={`${stage}·${stage + 1}차시 연결`}
+              checked={selectedLinks.includes(stage)}
+              onChange={(checked) => onContinuousLinksChange(checked
+                ? [...selectedLinks, stage].sort((a, b) => a - b)
+                : selectedLinks.filter((value) => value !== stage))} />
+          ))}
+          <p>1·2차시만 묶으려면 1·2 연결을 켜고 2·3 연결을 끄세요. 표에서 1·2·3차시가 붙어 있어도 3차시는 별도 배정하며, 같은 반의 묶음 수업과는 다른 요일에 배정합니다.</p>
+          <p>1·2·3차시 전체를 연속 배정하려면 1·2 연결과 2·3 연결을 모두 켜고, 표에서도 같은 요일의 연속된 세 교시에 1→2→3차시로 표시하세요. 그러면 같은 반의 3시간을 연속으로 묶어 배정합니다.</p>
+        </fieldset>
+      ) : null}
       <div className="slot-table-wrap">
         <table className="slot-table stage-table">
           <thead>
